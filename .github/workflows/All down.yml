@@ -1,0 +1,131 @@
+name: "🎬 دانلودر پیشرفته یوتیوب - نسخه اختصاصی"
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: '🔗 لینک های دانلود (برای چند لینک، با فاصله جدا کنید)'
+        required: true
+        type: string
+      mode:
+        description: '📦 حالت ذخیره‌سازی'
+        required: false
+        default: 'artifact'
+        type: choice
+        options:
+          - artifact   # آپلود موقت (امن)
+          - repo       # ذخیره دائمی در مخزن (پرریسک)
+      quality:
+        description: '🎬 کیفیت مورد نظر'
+        required: false
+        default: 'best'
+        type: choice
+        options:
+          - best
+          - 2160
+          - 1440
+          - 1080
+          - 720
+          - 480
+          - audio
+      password:
+        description: '🔒 رمز فایل ZIP (اختیاری)'
+        required: false
+        type: string
+
+jobs:
+  downloader:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    steps:
+      - name: بررسی کد (Checkout)
+        uses: actions/checkout@v4
+
+      - name: ⚙️ راه‌اندازی پروکسی WARP (برای دور زدن محدودیت)
+        run: |
+          docker network create warp-net || true
+          docker run -d --name warp --restart=always --network warp-net -p 1080:1080 --cap-add NET_ADMIN --sysctl net.ipv6.conf.all.disable_ipv6=0 --sysctl net.ipv4.conf.all.src_valid_mark=1 -v warp-data:/var/lib/cloudflare-warp caomingjun/warp
+          sleep 15
+          for i in {1..5}; do
+            curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE "warp=(on|plus)" && break || sleep 5
+          done
+
+      - name: 📦 نصب پیش‌نیازها (yt-dlp, ffmpeg, deno، ...)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip ffmpeg zip unzip p7zip-full curl jq bc
+          curl -fsSL https://deno.land/install.sh | sh
+          export DENO_INSTALL="$HOME/.deno"
+          export PATH="$DENO_INSTALL/bin:$PATH"
+          echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
+          pip3 install --upgrade yt-dlp
+
+      - name: 🎯 پردازش و دانلود ویدیوها
+        env:
+          URLS: ${{ github.event.inputs.urls }}
+          QUALITY: ${{ github.event.inputs.quality }}
+        run: |
+          SPLIT_MB=45
+          BACKUP_DIR="/tmp/download_backup_$$"
+          mkdir -p "$BACKUP_DIR"
+
+          # تابع تشخیص لینک مستقیم ویدیو (Placeholder)
+          extract_video_url() {
+            local URL=$1
+            # ۱. تلاش با yt-dlp
+            if yt-dlp -g --proxy "socks5://127.0.0.1:1080" "$URL" 2>/dev/null; then
+              return 0
+            fi
+            # ۲. اگر yt-dlp موفق نشد، می‌توان کدهای اضافی برای آنالیز صفحه و یافتن m3u8/mpd اضافه کرد
+            # ۳. در نهایت می‌توان از ابزاری مثل youtube-dl به عنوان fallback استفاده کرد (اختیاری)
+            return 1
+          }
+
+          for URL in $URLS; do
+            echo "در حال پردازش: $URL"
+            VIDEO_URL=$(extract_video_url "$URL")
+            if [ -n "$VIDEO_URL" ]; then
+              echo "لینک ویدیو یافت شد: $VIDEO_URL"
+              # دانلود ویدیو با yt-dlp و تنظیم کیفیت
+              if [ "$QUALITY" = "audio" ]; then
+                yt-dlp --proxy "socks5://127.0.0.1:1080" -f bestaudio --extract-audio --audio-format mp3 -o "$BACKUP_DIR/%(title)s.%(ext)s" "$VIDEO_URL"
+              else
+                yt-dlp --proxy "socks5://127.0.0.1:1080" -f "bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}]" --merge-output-format mp4 -o "$BACKUP_DIR/%(title)s.%(ext)s" "$VIDEO_URL"
+              fi
+            else
+              echo "⚠️ خطا: امکان یافتن لینک ویدیو برای $URL وجود ندارد."
+            fi
+          done
+
+      - name: (اختیاری) اعمال رمز و پارت بندی
+        if: ${{ github.event.inputs.password != '' }}
+        run: |
+          cd $BACKUP_DIR
+          zip -P "${{ github.event.inputs.password }}" -r -s ${SPLIT_MB}m "../archive.zip" .
+          cd ..
+          rm -rf $BACKUP_DIR
+          mkdir $BACKUP_DIR
+          mv archive.zip $BACKUP_DIR/دانلود-محافظت‌شده.zip
+
+      - name: 📤 آپلود نهایی (Artifact یا Repository)
+        if: ${{ github.event.inputs.mode == 'artifact' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloads-${{ github.run_id }}
+          path: $BACKUP_DIR/
+          retention-days: 30
+
+      - name: 💾 ذخیره دائمی در مخزن (اختیاری - پرریسک)
+        if: ${{ github.event.inputs.mode == 'repo' }}
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git fetch origin
+          git pull origin ${{ github.ref_name }} || true
+          mkdir -p downloads
+          cp -r $BACKUP_DIR/* downloads/
+          git add downloads/
+          git commit -m "افزودن فایل جدید از دانلودر عمومی" || echo "هیچ تغییری"
+          git push origin HEAD:${{ github.ref_name }}
